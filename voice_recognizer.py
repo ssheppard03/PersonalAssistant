@@ -4,6 +4,7 @@ import struct
 import speech_recognition as sr
 from dotenv import load_dotenv
 import os
+import audioop
 
 load_dotenv()
 
@@ -19,19 +20,20 @@ class VoiceRecognizer():
 
         self.pa = pyaudio.PyAudio()
         
-        # Find the correct input device and its supported sample rates
-        input_device_index, supported_sample_rate = self.find_input_device()
+        # Find the correct input device
+        input_device_index, self.device_sample_rate = self.find_input_device()
         
         if input_device_index is None:
             print("No suitable input device found!")
             self.audio_stream = None
             return
         
-        print(f"Using sample rate: {supported_sample_rate}")
+        print(f"Using device sample rate: {self.device_sample_rate} Hz")
+        print(f"Porcupine requires: 16000 Hz")
         
         try:
             self.audio_stream = self.pa.open(
-                rate=supported_sample_rate,
+                rate=self.device_sample_rate,  # Use the device's native sample rate
                 channels=1,
                 format=pyaudio.paInt16,
                 input=True,
@@ -44,61 +46,63 @@ class VoiceRecognizer():
             self.audio_stream = None
 
     def find_input_device(self):
-        """Find the first available input device and check supported sample rates"""
+        """Find the first available input device"""
         print("Searching for input devices...")
-        
-        # Common sample rates to try
-        sample_rates = [16000, 44100, 48000, 22050, 32000]
         
         for i in range(self.pa.get_device_count()):
             info = self.pa.get_device_info_by_index(i)
             if info['maxInputChannels'] >= 1:
-                print(f"\nTesting device {i}: {info['name']}")
+                print(f"Device {i}: {info['name']}")
                 print(f"  Default sample rate: {info['defaultSampleRate']}")
-                
-                # Test which sample rates are supported
-                for rate in sample_rates:
-                    if self.is_sample_rate_supported(i, rate):
-                        print(f"  ✓ Supports {rate} Hz")
-                        return i, rate
-                    else:
-                        print(f"  ✗ Does not support {rate} Hz")
+                return i, int(info['defaultSampleRate'])
         
         return None, None
 
-    def is_sample_rate_supported(self, device_index, sample_rate):
-        """Check if a sample rate is supported by the device"""
-        try:
-            # Try to open a stream with this sample rate
-            test_stream = self.pa.open(
-                rate=sample_rate,
-                channels=1,
-                format=pyaudio.paInt16,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=256
-            )
-            test_stream.close()
-            return True
-        except:
-            return False
+    def resample_audio(self, audio_data, from_rate, to_rate):
+        """Resample audio from one sample rate to another"""
+        if from_rate == to_rate:
+            return audio_data
+        
+        # Calculate the conversion factor
+        conversion_factor = to_rate / from_rate
+        
+        # Resample the audio
+        resampled_data = audioop.ratecv(
+            audio_data, 
+            2,  # Sample width in bytes (2 for 16-bit)
+            1,  # Number of channels
+            from_rate,
+            to_rate,
+            None
+        )[0]
+        
+        return resampled_data
 
     def listen(self):
         if self.audio_stream is None:
             print("Cannot listen - no audio stream available")
             return
         
-        print("Listening for wake word...")
+        print("Listening for wake word... (Say 'Jarvis')")
         try:
             while True:
+                # Read audio from microphone at device's sample rate
                 pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                
+                # Resample from device rate (44.1kHz) to Porcupine rate (16kHz)
+                if self.device_sample_rate != 16000:
+                    pcm = self.resample_audio(pcm, self.device_sample_rate, 16000)
+                
+                # Convert to the format Porcupine expects
                 pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
                 
+                # Process with Porcupine
                 keyword_index = self.porcupine.process(pcm)
                 
                 if keyword_index >= 0:
-                    print("Wake word detected, processing command...")
+                    print("Wake word detected! Processing command...")
                     self.process_command()
+                    
         except KeyboardInterrupt:
             print("Stopping listener...")
         except Exception as e:
@@ -107,7 +111,6 @@ class VoiceRecognizer():
     def process_command(self):
         r = sr.Recognizer()
         try:
-            # For speech recognition, we can use a different approach
             print("Listening for command...")
             with sr.Microphone() as source:
                 print("Adjusting for ambient noise...")
@@ -118,7 +121,7 @@ class VoiceRecognizer():
             try:
                 command = r.recognize_google(audio)
                 print(f"You said: {command}")
-                # Add your command processing logic here
+                # TODO add logic here
                 
             except sr.UnknownValueError:
                 print("Sorry, I didn't understand that.")
