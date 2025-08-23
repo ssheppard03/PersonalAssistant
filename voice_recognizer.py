@@ -5,6 +5,7 @@ import speech_recognition as sr
 from dotenv import load_dotenv
 import os
 import audioop
+import numpy as np
 
 load_dotenv()
 
@@ -31,13 +32,21 @@ class VoiceRecognizer():
         print(f"Using device sample rate: {self.device_sample_rate} Hz")
         print(f"Porcupine requires: 16000 Hz")
         
+        # Calculate the resampling ratio
+        self.resample_ratio = 16000 / self.device_sample_rate
+        print(f"Resampling ratio: {self.resample_ratio}")
+        
+        # Calculate how many frames we need to read to get the equivalent of porcupine.frame_length at 16kHz
+        self.required_frames = int(self.porcupine.frame_length / self.resample_ratio)
+        print(f"Reading {self.required_frames} frames from device to get {self.porcupine.frame_length} frames at 16kHz")
+        
         try:
             self.audio_stream = self.pa.open(
-                rate=self.device_sample_rate,  # Use the device's native sample rate
+                rate=self.device_sample_rate,
                 channels=1,
                 format=pyaudio.paInt16,
                 input=True,
-                frames_per_buffer=self.porcupine.frame_length,
+                frames_per_buffer=self.required_frames,
                 input_device_index=input_device_index
             )
             print(f"Successfully opened audio stream with device index {input_device_index}")
@@ -58,26 +67,6 @@ class VoiceRecognizer():
         
         return None, None
 
-    def resample_audio(self, audio_data, from_rate, to_rate):
-        """Resample audio from one sample rate to another"""
-        if from_rate == to_rate:
-            return audio_data
-        
-        # Calculate the conversion factor
-        conversion_factor = to_rate / from_rate
-        
-        # Resample the audio
-        resampled_data = audioop.ratecv(
-            audio_data, 
-            2,  # Sample width in bytes (2 for 16-bit)
-            1,  # Number of channels
-            from_rate,
-            to_rate,
-            None
-        )[0]
-        
-        return resampled_data
-
     def listen(self):
         if self.audio_stream is None:
             print("Cannot listen - no audio stream available")
@@ -86,18 +75,30 @@ class VoiceRecognizer():
         print("Listening for wake word... (Say 'Jarvis')")
         try:
             while True:
-                # Read audio from microphone at device's sample rate
-                pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                # Read the required number of frames from the device
+                pcm = self.audio_stream.read(self.required_frames, exception_on_overflow=False)
                 
-                # Resample from device rate (44.1kHz) to Porcupine rate (16kHz)
-                if self.device_sample_rate != 16000:
-                    pcm = self.resample_audio(pcm, self.device_sample_rate, 16000)
+                # Resample from device rate to 16kHz
+                resampled_pcm = audioop.ratecv(
+                    pcm, 
+                    2,  # Sample width in bytes (2 for 16-bit)
+                    1,  # Number of channels
+                    self.device_sample_rate,
+                    16000,
+                    None
+                )[0]
                 
-                # Convert to the format Porcupine expects
-                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
+                # Ensure we have exactly the number of samples Porcupine expects
+                if len(resampled_pcm) < self.porcupine.frame_length * 2:  # *2 because 16-bit = 2 bytes per sample
+                    # Pad with zeros if we don't have enough data
+                    padding_needed = (self.porcupine.frame_length * 2) - len(resampled_pcm)
+                    resampled_pcm += b'\x00' * padding_needed
+                
+                # Convert to the format Porcupine expects (array of 16-bit integers)
+                pcm_samples = struct.unpack_from("h" * self.porcupine.frame_length, resampled_pcm)
                 
                 # Process with Porcupine
-                keyword_index = self.porcupine.process(pcm)
+                keyword_index = self.porcupine.process(pcm_samples)
                 
                 if keyword_index >= 0:
                     print("Wake word detected! Processing command...")
@@ -107,6 +108,8 @@ class VoiceRecognizer():
             print("Stopping listener...")
         except Exception as e:
             print(f"Error in listen loop: {e}")
+            import traceback
+            traceback.print_exc()
 
     def process_command(self):
         r = sr.Recognizer()
@@ -121,7 +124,7 @@ class VoiceRecognizer():
             try:
                 command = r.recognize_google(audio)
                 print(f"You said: {command}")
-                # TODO add logic here
+                # Add your command processing logic here
                 
             except sr.UnknownValueError:
                 print("Sorry, I didn't understand that.")
